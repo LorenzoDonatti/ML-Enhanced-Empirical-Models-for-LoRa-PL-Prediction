@@ -1,7 +1,7 @@
 """RF, XGBoost, validation-tuned KNN and equal direct/residual ensembles."""
 import numpy as np
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -31,6 +31,12 @@ def make_model(name: str, seed: int, jobs: int):
 
 def rmse(y: np.ndarray, prediction: np.ndarray) -> float:
     return float(np.sqrt(mean_squared_error(y, prediction)))
+
+def metrics(y, prediction):
+    """Metrics on final path-loss predictions; R² is undefined for constant targets."""
+    r2 = float(r2_score(y, prediction)) if len(y) > 1 and np.var(y) > 0 else float('nan')
+    return {'test_rmse_db': rmse(y, prediction),
+            'test_mae_db': float(mean_absolute_error(y, prediction)), 'test_r2': r2}
 
 def fit_config(df, parts, config, seed, jobs):
     train, validation, test = parts
@@ -69,8 +75,8 @@ def fit_config(df, parts, config, seed, jobs):
         prediction = base[test] + model.predict(x[test])
         predictions[algorithm] = prediction
         records.append({'model': algorithm, 'validation_rmse_db': val_rmse,
-                        'test_rmse_db': rmse(y[test], prediction),
+                        **metrics(y[test], prediction),
                         'selected_k': chosen_k})
     predictions['ensemble'] = np.mean(list(predictions.values()), axis=0)
-    records.append({'model': 'ensemble', 'test_rmse_db': rmse(y[test], predictions['ensemble'])})
+    records.append({'model': 'ensemble', **metrics(y[test], predictions['ensemble'])})
     return records, predictions

@@ -18,6 +18,8 @@ residual learning on public urban LoRa measurements from Bonn, Germany.
 The implementation consists of **four Python files**. It downloads the public data,
 trains the models, and exports numerical results as CSV files. It is intended as an
 accessible research baseline for studying analytical models combined with machine learning.
+Numerical diagnostics include MAE, R², a training-mean baseline, paired cluster-bootstrap
+intervals, and distance-bin errors; no plotting dependencies are needed.
 
 ## Research overview
 
@@ -62,7 +64,7 @@ Start with one split and one seed:
 python run.py --study controls --protocols random --seeds 0 --output results/quickstart
 ```
 
-This trains all seven controlled-input configurations on the **complete dataset**,
+This evaluates a training-mean baseline and trains all seven controlled-input configurations on the **complete dataset**,
 using one random partition. It is a smaller experiment, not a subsample of the data.
 The first run downloads `samples.csv` and `gateways.csv` into `data/`.
 
@@ -95,8 +97,10 @@ random seed=0  ldpl_basic: 6.4256 dB
 random seed=0  oh_continuous: 6.2908 dB
 ```
 
-After fitting, the terminal also prints an aggregate table containing each
-individual learner and its ensemble, followed by the output directory.
+After fitting, the terminal also prints an aggregate table containing the baseline,
+each individual learner, and its ensemble, followed by the output directory.
+This command produces 29 metric rows (one constant baseline plus 28 learned-model
+results) and six paired bootstrap comparisons.
 These seed-zero values are not the five-seed means reported in the manuscript.
 
 ### 2. CSV files
@@ -104,15 +108,19 @@ These seed-zero values are not the five-seed means reported in the manuscript.
 ```text
 results/quickstart/
 ├── runs.csv
-└── summary.csv
+├── summary.csv
+├── comparisons.csv
+└── distance_errors.csv
 ```
 
 Gateway experiments additionally generate `gateways.csv`.
 
 | File | Contents | Typical use |
 |---|---|---|
-| `runs.csv` | One row per component or ensemble, per configuration and partition; also classical/linear baselines when requested | Compare individual fits and inspect selected KNN settings |
-| `summary.csv` | Mean test RMSE, sample standard deviation, and number of valid runs for each protocol/configuration/model | Compare repeated-partition results |
+| `runs.csv` | RMSE, MAE, and R² per component or ensemble, per configuration and partition; also classical/linear baselines when requested | Compare individual fits and inspect selected KNN settings |
+| `summary.csv` | Mean, sample standard deviation, and valid-run count for RMSE, MAE, and R² per protocol/configuration/model | Compare repeated-partition results |
+| `comparisons.csv` | Seed-zero paired cluster-bootstrap differences in RMSE and conditional 95% intervals | Assess uncertainty in the paper comparisons |
+| `distance_errors.csv` | Seed-zero MAE, RMSE, and reception counts in 0.5-km distance intervals | Inspect distance-dependent errors without plots |
 | `gateways.csv` | Macro and pooled test RMSE per configuration/model across held-out receivers | Compare receiver transfer |
 
 For example, an ensemble row in `runs.csv` identifies `protocol=random`, `seed=0`,
@@ -126,17 +134,22 @@ receptions. The same configuration has separate `rf`, `xgboost`, and `knn` rows.
 | `seed` | Random seed for the partition and learner fitting |
 | `gateway` | Held-out receiver identifier; empty for other experiments |
 | `config` | Feature/target configuration, listed below; for classical baselines, the anchor name |
-| `model` | `rf`, `xgboost`, `knn`, `ensemble`, `linear`, or `classical` |
+| `model` | `rf`, `xgboost`, `knn`, `ensemble`, `linear`, `classical`, or `constant` |
 | `train_rows`, `validation_rows`, `test_rows` | Number of receptions in each partition |
 | `validation_rmse_db` | Component validation RMSE; not emitted for ensembles or classical/linear rows |
 | `test_rmse_db` | Test RMSE of the final path-loss predictions, including the anchor for residual models |
+| `test_mae_db` | Mean absolute test error in dB |
+| `test_r2` | Test coefficient of determination; undefined for fewer than two observations or a constant target |
 | `selected_k` | Validation-selected neighbor count for KNN; empty for other models |
 | `status` | `infeasible` for a partition with fewer than 100 training or validation rows; otherwise empty |
 
 Infeasible rows use `config=infeasible` and `model=none`, with no error estimate.
 They remain visible in `runs.csv` and are excluded from the summary.
 
-`summary.csv` contains `protocol,config,model,mean,std,count`. For the quick-start
+`summary.csv` retains `protocol,config,model,mean,std,count` for RMSE and adds
+`mae_db_mean`, `mae_db_std`, `mae_db_count`, `r2_mean`, `r2_std`, and `r2_count`.
+Each metric is aggregated across runs; this is not a pooled R². Undefined R² values
+are excluded from its mean and count. For the quick-start
 run, `count=1` and `std` is empty (`NaN` in the terminal): one observation has no
 sample standard deviation. For the default repeated-split study, count is normally
 five, or four for the feasible 1,000-m runs. Gateway summaries average nine receivers;
@@ -155,6 +168,44 @@ import pandas as pd
 summary = pd.read_csv("results/quickstart/summary.csv")
 print(summary.loc[summary["model"].eq("ensemble")])
 ```
+
+### 3. Statistical and distance diagnostics
+
+Every feasible partition includes `config=training_mean`, `model=constant`, which
+predicts the training-target mean for all test receptions. It never uses test or
+validation targets to set the prediction. Gateway experiments also report
+uncorrected OH alongside the learned models.
+
+`comparisons.csv` uses **2,000 paired cluster-bootstrap replicates**, with RNG seed
+zero, for fits trained on split seed zero. Random-row and packet-grouped tests
+resample proxy packet groups; spatial and buffered tests resample held-out 500-m
+tiles defined using the full campaign grid. Entire clusters are sampled with
+replacement, and both models receive exactly the same sampled clusters. No models
+are refitted. The 2.5th and 97.5th percentiles give the conditional 95% interval.
+
+The comparison columns identify configurations/models A and B. `point_db` is
+**RMSE(A) − RMSE(B)**; negative values favor A. `lower_db` and `upper_db` are the
+interval endpoints. `clusters` and `repetitions` document the resampling size.
+The implemented comparisons, when both fits are present, are:
+
+- Initial OH ensemble versus each of its RF, XGBoost, and KNN components.
+- Height-augmented OH ensemble versus the height-augmented direct ensemble.
+- Initial OH ensemble versus the height-augmented direct ensemble.
+- Initial OH ensemble versus the basic direct ensemble.
+
+These intervals describe test-cluster variation conditional on fitted models and
+chosen hyperparameters. They do not replace variation across training seeds,
+include no multiple-comparison adjustment, and are not equivalence tests.
+No bootstrap is emitted for sample-count controls or gateway holdouts.
+If seed zero or a required pair is absent, the corresponding comparisons are absent;
+a file with only its header means no eligible comparisons were run.
+
+`distance_errors.csv` covers every evaluated model for seed zero, including gateway
+holdouts. Bins are half-open `[lower_km, upper_km)` intervals of width 0.5 km.
+`count` is the number of test receptions; `mae_db` and `rmse_db` describe errors
+within that bin. Empty bins are omitted, and sparse bins are retained so their
+limited support remains visible. For the paper's distance analysis, select
+`protocol=packet`, `config=oh_basic`, and bins with `count >= 100`.
 
 ## Experiment options
 
@@ -198,7 +249,7 @@ Other options: `--jobs 4`, `--data data`, and `--output results`.
 See `python run.py --help` for the complete command-line interface.
 
 **Each execution overwrites its output files.** Use separate output directories
-for separate experiments. `runs.csv` is written progressively; summaries are
+for separate experiments. `runs.csv`, `comparisons.csv`, and `distance_errors.csv` are written progressively; summaries are
 created after a successful run. There is no automatic resume mechanism. When
 reusing a directory, remove older outputs first so stale summaries are not mistaken
 for the results of an interrupted run.
@@ -249,9 +300,9 @@ at 1,000 m; receiver results use nine holdouts.
 The original OH ensemble without explicit height input to its learners yields
 approximately 6.35, 6.35, and 7.52 dB under random, packet and spatial partitions.
 
-This compact companion implements the main RMSE comparisons. The manuscript's
-bootstrap intervals, MAE/R² analyses, distance-bin plots, and publication figures
-are outside its scope. The reference values are rounded; seed selection and the
+This compact companion implements the main RMSE comparisons, MAE/R² metrics,
+training-mean baseline, conditional paired bootstrap intervals, and numerical
+distance-bin errors. Publication figures and plotting are outside its scope. The reference values are rounded; seed selection and the
 execution environment matter when comparing results.
 
 ## Repository structure
@@ -301,7 +352,7 @@ This data license does not assign a license to the companion implementation.
 
 Please cite the companion manuscript and the original dataset publication when
 using these experiments. The entry below identifies the manuscript; it does not
-claim journal publication or assign a DOI. Replace it with the final bibliographic
+claim journal publication or assign a DOI. It will be Replaced with the final bibliographic
 record when available.
 
 ```bibtex

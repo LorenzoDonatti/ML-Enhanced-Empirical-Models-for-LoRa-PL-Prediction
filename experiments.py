@@ -1,12 +1,13 @@
 """Numeric experiments: baselines, anchors, matched inputs, buffers and gateways."""
 import numpy as np
+import pandas as pd
 from sklearn.neighbors import BallTree
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
-from data import split_rows, packet_groups, fit_ldpl_bonn_train, CLASSICAL_BASELINES
-from models import fit_config, rmse
+from data import split_rows, packet_groups, fit_ldpl_bonn_train, CLASSICAL_BASELINES, spatial_groups
+from models import fit_config, rmse, metrics
 
 RADIUS_M = 6371008.8
 
@@ -39,6 +40,51 @@ def buffered_split(df, seed, buffer_m):
     return (train, validation, test), details
 
 
+def paired_bootstrap(y, a, b, groups, repetitions=2000):
+    """Paired cluster percentile CI for RMSE(a) - RMSE(b), conditional on fits."""
+    codes, unique = pd.factorize(groups, sort=False)
+    counts = np.bincount(codes)
+    a_sse = np.bincount(codes, weights=(y-a)**2)
+    b_sse = np.bincount(codes, weights=(y-b)**2)
+    rng = np.random.default_rng(0)
+    delta = np.empty(repetitions)
+    for i in range(repetitions):
+        selected = rng.integers(0, len(unique), len(unique))
+        n = counts[selected].sum()
+        delta[i] = np.sqrt(a_sse[selected].sum()/n)-np.sqrt(b_sse[selected].sum()/n)
+    return dict(point_db=rmse(y,a)-rmse(y,b),
+                lower_db=float(np.quantile(delta,.025)), upper_db=float(np.quantile(delta,.975)),
+                clusters=len(unique), repetitions=repetitions)
+
+
+def diagnostics(df, test, predictions, protocol, seed, gateway):
+    """Seed-zero distance bins and paper comparisons, without storing raw predictions."""
+    if seed != 0:
+        return
+    y = df.path_loss.to_numpy()[test]
+    common = dict(protocol=protocol, seed=seed, gateway=gateway)
+    bins = np.floor(df.gw_distance_m.to_numpy()[test]/500).astype(int)
+    for (config, model), prediction in predictions.items():
+        for bin_id in np.unique(bins):
+            selected = bins == bin_id
+            scores = metrics(y[selected], prediction[selected])
+            yield dict(_kind='distance', **common, config=config, model=model,
+                       lower_km=bin_id*.5, upper_km=(bin_id+1)*.5, count=int(selected.sum()),
+                       mae_db=scores['test_mae_db'], rmse_db=scores['test_rmse_db'])
+    if protocol not in ('random','packet','spatial_500m') and not protocol.startswith('buffer'):
+        return
+    grouping = 'packet' if protocol in ('random','packet') else 'spatial_500m'
+    groups = (packet_groups(df) if grouping == 'packet' else spatial_groups(df)).iloc[test]
+    pairs = [(('oh_basic','ensemble'),('oh_basic',m)) for m in ('rf','xgboost','knn')]
+    pairs += [((a,'ensemble'),(b,'ensemble')) for a,b in
+              [('oh_height','direct_height'),('oh_basic','direct_height'),('oh_basic','direct_basic')]]
+    for a,b in pairs:
+        if a in predictions and b in predictions:
+            yield dict(_kind='comparison', **common, config_a=a[0], model_a=a[1],
+                       config_b=b[0], model_b=b[1], grouping=grouping,
+                       **paired_bootstrap(y,predictions[a],predictions[b],groups))
+
+
 def evaluate(df, parts, configs, seed, jobs, protocol, basics=False, gateway=''):
     train, val, test = parts
     common = dict(protocol=protocol, seed=seed, gateway=gateway,
@@ -48,23 +94,36 @@ def evaluate(df, parts, configs, seed, jobs, protocol, basics=False, gateway='')
         return
     df['ldpl_bonn_train'], _ = fit_ldpl_bonn_train(df, train)
     y = df.path_loss.to_numpy()
+    predictions = {}
+    mean_prediction = np.full(len(test), y[train].mean())
+    yield {**common, 'config':'training_mean', 'model':'constant', **metrics(y[test],mean_prediction)}
+    if seed == 0:
+        predictions[('training_mean','constant')] = mean_prediction
+    if basics or protocol == 'gateway':
+        for name in ([*CLASSICAL_BASELINES, 'ldpl_bonn_train'] if basics else ['okumura_hata']):
+            prediction = df[name].to_numpy()[test]
+            yield {**common, 'config':name, 'model':'classical', **metrics(y[test],prediction)}
+            if seed == 0:
+                predictions[(name,'classical')] = prediction
     if basics:
-        for name in [*CLASSICAL_BASELINES, 'ldpl_bonn_train']:
-            yield {**common, 'config':name, 'model':'classical',
-                   'test_rmse_db':rmse(y[test], df[name].to_numpy()[test])}
         x = df[['latitude','longitude','log_distance_km']].to_numpy()
         for name, base in [('direct_basic', np.zeros(len(df))),
                            ('oh_basic', df.okumura_hata.to_numpy())]:
             model = make_pipeline(StandardScaler(), LinearRegression())
             model.fit(x[train], y[train]-base[train])
-            yield {**common, 'config':name, 'model':'linear',
-                   'test_rmse_db':rmse(y[test], base[test]+model.predict(x[test]))}
+            prediction = base[test]+model.predict(x[test])
+            yield {**common, 'config':name, 'model':'linear', **metrics(y[test],prediction)}
+            if seed == 0:
+                predictions[(name,'linear')] = prediction
     for config in configs:
-        records, _ = fit_config(df, parts, config, seed, jobs)
+        records, fitted_predictions = fit_config(df, parts, config, seed, jobs)
         print(f'{protocol} seed={seed} {gateway} {config}: '
               f'{records[-1]["test_rmse_db"]:.4f} dB', flush=True)
         for record in records:
             yield {**common, 'config':config, **record}
+        if seed == 0:
+            predictions.update({(config,m):p for m,p in fitted_predictions.items()})
+    yield from diagnostics(df,test,predictions,protocol,seed,gateway)
 
 
 def run(df, study, seeds, jobs, protocols, radii):

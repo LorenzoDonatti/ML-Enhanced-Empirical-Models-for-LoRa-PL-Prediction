@@ -1,6 +1,7 @@
 """Run Bonn path-loss experiments and print/write numeric results."""
 import argparse
 import csv
+from contextlib import ExitStack
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -26,19 +27,37 @@ def main():
     print(f'{meta["used_rows"]:,} receptions; {df.gw.nunique()} gateways',flush=True)
     args.output.mkdir(parents=True,exist_ok=True)
     fields = ['protocol','seed','gateway','config','model','train_rows','validation_rows',
-              'test_rows','status','validation_rmse_db','test_rmse_db','selected_k']
+              'test_rows','status','validation_rmse_db','test_rmse_db','test_mae_db','test_r2','selected_k']
     rows = []
-    with (args.output/'runs.csv').open('w',newline='') as stream:
-        writer = csv.DictWriter(stream,fieldnames=fields)
-        writer.writeheader()
+    schemas = {
+        'runs': ('runs.csv', fields),
+        'comparison': ('comparisons.csv', ['protocol','seed','gateway','config_a','model_a',
+            'config_b','model_b','grouping','point_db','lower_db','upper_db','clusters','repetitions']),
+        'distance': ('distance_errors.csv', ['protocol','seed','gateway','config','model',
+            'lower_km','upper_km','count','mae_db','rmse_db']),
+    }
+    with ExitStack() as stack:
+        writers = {}
+        for kind,(filename,columns) in schemas.items():
+            stream = stack.enter_context((args.output/filename).open('w',newline=''))
+            writer = csv.DictWriter(stream,fieldnames=columns)
+            writer.writeheader()
+            writers[kind] = (writer,stream)
         for record in run(df,args.study,args.seeds,args.jobs,args.protocols,args.radii):
-            rows.append(record)
+            kind = record.pop('_kind','runs')
+            if kind == 'runs':
+                rows.append(record)
+            writer,stream = writers[kind]
             writer.writerow(record)
             stream.flush()
     scores = pd.DataFrame(rows)
     valid = scores.loc[scores.model.ne('none')]
     if not valid.empty:
-        summary = valid.groupby(['protocol','config','model']).test_rmse_db.agg(['mean','std','count'])
+        grouped = valid.groupby(['protocol','config','model'])
+        summary = grouped.test_rmse_db.agg(['mean','std','count'])
+        for metric, prefix in [('test_mae_db','mae_db'),('test_r2','r2')]:
+            for stat in ('mean','std','count'):
+                summary[f'{prefix}_{stat}'] = grouped[metric].agg(stat)
         summary.to_csv(args.output/'summary.csv')
         print(summary.to_string(float_format=lambda x:f'{x:.4f}'))
         gateways = valid.loc[valid.protocol.eq('gateway')]
